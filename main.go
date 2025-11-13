@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -49,10 +49,10 @@ func secureRandIntn(n int) int {
 	if n <= 0 {
 		return 0
 	}
-	num, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	num, err := crand.Int(crand.Reader, big.NewInt(int64(n)))
 	if err != nil {
 		var fallback int64
-		if err := binary.Read(rand.Reader, binary.BigEndian, &fallback); err != nil {
+		if err := binary.Read(crand.Reader, binary.BigEndian, &fallback); err != nil {
 			return int(big.NewInt(0).Mod(big.NewInt(int64(os.Getpid())^int64(n)), big.NewInt(int64(n))).Int64())
 		}
 		if fallback < 0 {
@@ -100,14 +100,13 @@ func sanitizeText(text string) string {
 
 func (m *MarkovSeedGenerator) Train(text string) error {
 	text = sanitizeText(text)
-	
 	runes := []rune(text)
 	if len(runes) <= m.N {
 		return fmt.Errorf("text length %d must be greater than n %d", len(runes), m.N)
 	}
 
 	m.Text = text
-	
+
 	for i := 0; i <= len(runes)-m.N-1; i++ {
 		key := string(runes[i:i+m.N])
 		nextChar := runes[i+m.N]
@@ -129,11 +128,11 @@ func (m *MarkovSeedGenerator) TrainFromFile(filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get file info: %w", err)
 	}
-	
+
 	if info.Size() == 0 {
 		return fmt.Errorf("training file is empty")
 	}
-	
+
 	if info.Size() > 100*1024*1024 {
 		return fmt.Errorf("file too large: %d bytes", info.Size())
 	}
@@ -233,7 +232,7 @@ func (m *MarkovSeedGenerator) Generate(length int, startWith ...string) (string,
 
 		nextChar := nextChars[m.randIntn(len(nextChars))]
 		output = append(output, nextChar)
-		
+
 		seedRunes := []rune(seed)
 		seed = string(seedRunes[1:]) + string(nextChar)
 	}
@@ -312,7 +311,7 @@ func (m *MarkovSeedGenerator) ValidateModel() error {
 	if m.N <= 0 {
 		return fmt.Errorf("invalid n value: %d", m.N)
 	}
-	
+
 	for key, transitions := range m.Model {
 		if utf8.RuneCountInString(key) != m.N {
 			return fmt.Errorf("invalid key length: %q (expected %d)", key, m.N)
