@@ -10,17 +10,19 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
 
 type MarkovSeedGenerator struct {
-	N            int
-	Model        map[string][]rune
-	Text         string
-	Verbose      bool
+	N             int
+	Model         map[string][]rune
+	Verbose       bool
 	UseCryptoRand bool
-	logMessages  []string
+	logMessages   []string
+	mu            sync.RWMutex
+	logMu         sync.Mutex
 }
 
 type ModelStats struct {
@@ -52,9 +54,7 @@ func secureRandIntn(n int) int {
 	num, err := crand.Int(crand.Reader, big.NewInt(int64(n)))
 	if err != nil {
 		var fallback int64
-		if err := binary.Read(crand.Reader, binary.BigEndian, &fallback); err != nil {
-			return int(big.NewInt(0).Mod(big.NewInt(int64(os.Getpid())^int64(n)), big.NewInt(int64(n))).Int64())
-		}
+		binary.Read(crand.Reader, binary.BigEndian, &fallback)
 		if fallback < 0 {
 			fallback = -fallback
 		}
@@ -67,22 +67,31 @@ func (m *MarkovSeedGenerator) randIntn(n int) int {
 	if m.UseCryptoRand {
 		return secureRandIntn(n)
 	}
-	return int(big.NewInt(0).Mod(big.NewInt(int64(os.Getpid())^int64(n)), big.NewInt(int64(n))).Int64())
+	return secureRandIntn(n)
 }
 
 func (m *MarkovSeedGenerator) log(format string, args ...interface{}) {
-	message := fmt.Sprintf(format, args...)
-	if m.Verbose {
-		m.logMessages = append(m.logMessages, message)
-		log.Println(message)
+	if !m.Verbose {
+		return
 	}
+	message := fmt.Sprintf(format, args...)
+	m.logMu.Lock()
+	m.logMessages = append(m.logMessages, message)
+	m.logMu.Unlock()
+	log.Println(message)
 }
 
 func (m *MarkovSeedGenerator) GetLogs() []string {
-	return m.logMessages
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
+	logs := make([]string, len(m.logMessages))
+	copy(logs, m.logMessages)
+	return logs
 }
 
 func (m *MarkovSeedGenerator) ClearLogs() {
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
 	m.logMessages = m.logMessages[:0]
 }
 
@@ -105,12 +114,15 @@ func (m *MarkovSeedGenerator) Train(text string) error {
 		return fmt.Errorf("text length %d must be greater than n %d", len(runes), m.N)
 	}
 
-	m.Text = text
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	for i := 0; i <= len(runes)-m.N-1; i++ {
-		key := string(runes[i:i+m.N])
-		nextChar := runes[i+m.N]
-		m.Model[key] = append(m.Model[key], nextChar)
+	for i := 0; i <= len(runes)-m.N; i++ {
+		key := string(runes[i : i+m.N])
+		if i+m.N < len(runes) {
+			nextChar := runes[i+m.N]
+			m.Model[key] = append(m.Model[key], nextChar)
+		}
 	}
 
 	m.log("Trained model with %d n-grams", len(m.Model))
@@ -139,39 +151,19 @@ func (m *MarkovSeedGenerator) TrainFromFile(filename string) error {
 
 	m.log("Training from file: %s", filename)
 
-	buffer := make([]byte, 8192)
 	var textBuilder strings.Builder
-	processedBytes := int64(0)
-	fileSize := info.Size()
-
-	for {
-		n, err := file.Read(buffer)
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("error reading file: %w", err)
-		}
-
-		if n == 0 {
-			break
-		}
-
-		chunk := sanitizeText(string(buffer[:n]))
-		textBuilder.WriteString(chunk)
-		processedBytes += int64(n)
-
-		if m.Verbose && fileSize > 0 {
-			percent := float64(processedBytes) / float64(fileSize) * 100
-			m.log("Processed %d/%d bytes (%.1f%%)", processedBytes, fileSize, percent)
-		}
-
-		if err == io.EOF {
-			break
-		}
+	_, err = io.Copy(&textBuilder, file)
+	if err != nil {
+		return fmt.Errorf("error reading file: %w", err)
 	}
 
 	return m.Train(textBuilder.String())
 }
 
 func (m *MarkovSeedGenerator) Generate(length int, startWith ...string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	if len(m.Model) == 0 {
 		return "", fmt.Errorf("untrained model")
 	}
@@ -193,7 +185,7 @@ func (m *MarkovSeedGenerator) Generate(length int, startWith ...string) (string,
 		}
 	}
 
-	if seed == "" || m.Model[seed] == nil {
+	if seed == "" || len(m.Model[seed]) == 0 {
 		seed = keys[m.randIntn(len(keys))]
 		if len(startWith) > 0 {
 			m.log("Warning: Starting text %q not found, using random n-gram", startWith[0])
@@ -208,21 +200,11 @@ func (m *MarkovSeedGenerator) Generate(length int, startWith ...string) (string,
 		nextChars := m.Model[seed]
 		if len(nextChars) == 0 {
 			similar := m.findSimilarNgram(seed)
-			if similar != "" {
+			if similar != "" && len(m.Model[similar]) > 0 {
 				m.log("Fallback: using similar n-gram %q for %q", similar, seed)
 				nextChars = m.Model[similar]
 			} else {
-				runes := []rune(m.Text)
-				if len(runes) == 0 {
-					return "", fmt.Errorf("no text available for fallback")
-				}
-				nextChar := runes[m.randIntn(len(runes))]
-				output = append(output, nextChar)
-				if len(seed) > 0 {
-					seedRunes := []rune(seed)
-					seed = string(seedRunes[1:]) + string(nextChar)
-				}
-				continue
+				nextChars = m.Model[keys[m.randIntn(len(keys))]]
 			}
 		}
 
@@ -241,21 +223,24 @@ func (m *MarkovSeedGenerator) Generate(length int, startWith ...string) (string,
 }
 
 func (m *MarkovSeedGenerator) findSimilarNgram(target string) string {
-	bestMatch := ""
-	bestDistance := -1
 	targetRunes := []rune(target)
+	bestMatch := ""
+	bestDistance := int(^uint(0) >> 1)
 
 	for key := range m.Model {
 		if len(m.Model[key]) == 0 {
 			continue
 		}
 		keyRunes := []rune(key)
-		distance := levenshteinDistance(targetRunes, keyRunes)
-		if bestDistance == -1 || distance < bestDistance {
+		if len(keyRunes) != len(targetRunes) {
+			continue
+		}
+		distance := simpleRuneDistance(targetRunes, keyRunes)
+		if distance < bestDistance {
 			bestDistance = distance
 			bestMatch = key
 		}
-		if bestDistance <= 1 {
+		if bestDistance == 0 {
 			break
 		}
 	}
@@ -263,51 +248,23 @@ func (m *MarkovSeedGenerator) findSimilarNgram(target string) string {
 	return bestMatch
 }
 
-func levenshteinDistance(a, b []rune) int {
-	if len(a) == 0 {
-		return len(b)
+func simpleRuneDistance(a, b []rune) int {
+	if len(a) != len(b) {
+		return int(^uint(0) >> 1)
 	}
-	if len(b) == 0 {
-		return len(a)
-	}
-
-	matrix := make([][]int, len(a)+1)
-	for i := range matrix {
-		matrix[i] = make([]int, len(b)+1)
-		matrix[i][0] = i
-	}
-	for j := range matrix[0] {
-		matrix[0][j] = j
-	}
-
-	for i := 1; i <= len(a); i++ {
-		for j := 1; j <= len(b); j++ {
-			cost := 1
-			if a[i-1] == b[j-1] {
-				cost = 0
-			}
-			matrix[i][j] = min(
-				matrix[i-1][j]+1,
-				matrix[i][j-1]+1,
-				matrix[i-1][j-1]+cost,
-			)
+	distance := 0
+	for i := range a {
+		if a[i] != b[i] {
+			distance++
 		}
 	}
-
-	return matrix[len(a)][len(b)]
-}
-
-func min(values ...int) int {
-	minVal := values[0]
-	for _, v := range values[1:] {
-		if v < minVal {
-			minVal = v
-		}
-	}
-	return minVal
+	return distance
 }
 
 func (m *MarkovSeedGenerator) ValidateModel() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	if m.N <= 0 {
 		return fmt.Errorf("invalid n value: %d", m.N)
 	}
@@ -324,6 +281,9 @@ func (m *MarkovSeedGenerator) ValidateModel() error {
 }
 
 func (m *MarkovSeedGenerator) GetModelStats() ModelStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	stats := ModelStats{
 		MinTransitions: -1,
 	}
@@ -352,6 +312,9 @@ func (m *MarkovSeedGenerator) GetModelStats() ModelStats {
 }
 
 func (m *MarkovSeedGenerator) SaveModel(filename string) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	file, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("failed to create model file: %w", err)
@@ -375,16 +338,29 @@ func (m *MarkovSeedGenerator) LoadModel(filename string) error {
 	}
 	defer file.Close()
 
+	var model map[string][]rune
 	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&m.Model); err != nil {
+	if err := decoder.Decode(&model); err != nil {
 		return fmt.Errorf("failed to decode model: %w", err)
 	}
+
+	for key := range model {
+		if utf8.RuneCountInString(key) != m.N {
+			return fmt.Errorf("loaded model key %q has length != %d", key, m.N)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Model = model
 
 	m.log("Model loaded from %s with %d n-grams", filename, len(m.Model))
 	return nil
 }
 
 func (m *MarkovSeedGenerator) GetAvailableKeys() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	keys := make([]string, 0, len(m.Model))
 	for k := range m.Model {
 		keys = append(keys, k)
@@ -393,12 +369,15 @@ func (m *MarkovSeedGenerator) GetAvailableKeys() []string {
 }
 
 func (m *MarkovSeedGenerator) GetTransitions(key string) []rune {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.Model[key]
 }
 
 func (m *MarkovSeedGenerator) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.Model = make(map[string][]rune)
-	m.Text = ""
 	m.ClearLogs()
 }
 
